@@ -99,13 +99,18 @@ func (b *RelayBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	if port == 0 {
 		port = 51820
 	}
-	fn := func(buff []byte) (int, conn.Endpoint, error) {
+	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		dg, ok := <-b.recv
 		if !ok {
-			return 0, nil, net.ErrClosed
+			return 0, net.ErrClosed
 		}
-		n := copy(buff, dg.data)
-		return n, dg.endpoint, nil
+		if len(packets) == 0 || len(sizes) == 0 || len(eps) == 0 {
+			return 0, net.ErrClosed
+		}
+		n := copy(packets[0], dg.data)
+		sizes[0] = n
+		eps[0] = dg.endpoint
+		return 1, nil
 	}
 	return []conn.ReceiveFunc{fn}, port, nil
 }
@@ -126,8 +131,15 @@ func (b *RelayBind) Close() error {
 // SetMark is a no-op since the relay transport is opaque to the kernel.
 func (*RelayBind) SetMark(_ uint32) error { return nil }
 
-// Send forwards a single encrypted datagram to the registered C callback.
-func (b *RelayBind) Send(buff []byte, ep conn.Endpoint) error {
+// BatchSize reports the maximum number of buffers wireguard-go may pass to
+// Send. The relay transport delivers one datagram at a time over Swift, so we
+// match the non-GSO Linux/non-Linux default of 1.
+func (*RelayBind) BatchSize() int { return 1 }
+
+// Send forwards each encrypted datagram in buffs to the registered C callback.
+// wireguard-go's Bind contract caps len(buffs) at BatchSize(); we still loop in
+// case a caller passes more than one.
+func (b *RelayBind) Send(buffs [][]byte, ep conn.Endpoint) error {
 	rep, ok := ep.(RelayEndpoint)
 	if !ok {
 		return conn.ErrWrongEndpointType
@@ -148,11 +160,13 @@ func (b *RelayBind) Send(buff []byte, ep conn.Endpoint) error {
 	if len(epBytes) > 0 {
 		epPtr = (*C.uint8_t)(unsafe.Pointer(&epBytes[0]))
 	}
-	var dataPtr *C.uint8_t
-	if len(buff) > 0 {
-		dataPtr = (*C.uint8_t)(unsafe.Pointer(&buff[0]))
+	for _, buff := range buffs {
+		if len(buff) == 0 {
+			continue
+		}
+		dataPtr := (*C.uint8_t)(unsafe.Pointer(&buff[0]))
+		C.callRelaySend(cb, ctx, epPtr, C.size_t(len(epBytes)), dataPtr, C.size_t(len(buff)))
 	}
-	C.callRelaySend(cb, ctx, epPtr, C.size_t(len(epBytes)), dataPtr, C.size_t(len(buff)))
 	return nil
 }
 

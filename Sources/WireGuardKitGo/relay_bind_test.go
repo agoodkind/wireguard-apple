@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"unsafe"
+
+	"golang.zx2c4.com/wireguard/conn"
 )
 
 func TestRelayBindOpenAndInject(t *testing.T) {
@@ -38,21 +40,26 @@ func TestRelayBindOpenAndInject(t *testing.T) {
 		}
 	}()
 
-	buf := make([]byte, 65535)
-	n, ep, err := fns[0](buf)
+	packets := [][]byte{make([]byte, 65535)}
+	sizes := make([]int, 1)
+	eps := make([]conn.Endpoint, 1)
+	n, err := fns[0](packets, sizes, eps)
 	if err != nil {
 		t.Fatalf("ReceiveFunc returned error: %v", err)
 	}
-	if n != len(payload) {
-		t.Fatalf("received %d bytes, want %d", n, len(payload))
+	if n != 1 {
+		t.Fatalf("ReceiveFunc returned %d packets, want 1", n)
+	}
+	if sizes[0] != len(payload) {
+		t.Fatalf("received %d bytes, want %d", sizes[0], len(payload))
 	}
 	for i := range payload {
-		if buf[i] != payload[i] {
-			t.Fatalf("byte %d mismatch: got 0x%x want 0x%x", i, buf[i], payload[i])
+		if packets[0][i] != payload[i] {
+			t.Fatalf("byte %d mismatch: got 0x%x want 0x%x", i, packets[0][i], payload[i])
 		}
 	}
-	if ep.DstToString() != endpoint {
-		t.Fatalf("endpoint mismatch: got %q want %q", ep.DstToString(), endpoint)
+	if eps[0].DstToString() != endpoint {
+		t.Fatalf("endpoint mismatch: got %q want %q", eps[0].DstToString(), endpoint)
 	}
 }
 
@@ -68,8 +75,10 @@ func TestRelayBindCloseUnblocksReceive(t *testing.T) {
 	var receivedErr error
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 64)
-		_, _, receivedErr = fns[0](buf)
+		packets := [][]byte{make([]byte, 64)}
+		sizes := make([]int, 1)
+		eps := make([]conn.Endpoint, 1)
+		_, receivedErr = fns[0](packets, sizes, eps)
 	}()
 	bind.Close()
 	wg.Wait()
@@ -97,8 +106,11 @@ func TestRelayBindSendWithoutCallbackIsNoOp(t *testing.T) {
 	bind := NewRelayBind(nil, nil)
 	defer bind.Close()
 	ep := RelayEndpoint("ignored")
-	if err := bind.Send([]byte{0x01}, ep); err != nil {
+	if err := bind.Send([][]byte{{0x01}}, ep); err != nil {
 		t.Fatalf("Send with nil callback returned error: %v", err)
+	}
+	if bind.BatchSize() != 1 {
+		t.Fatalf("BatchSize() = %d, want 1", bind.BatchSize())
 	}
 }
 
