@@ -1,4 +1,4 @@
-// swift-tools-version:5.3
+// swift-tools-version:5.5
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -31,10 +31,19 @@ let package = Package(
                 "go.mod",
                 "go.sum",
                 "api-apple.go",
+                "relay_bind.go",
+                "relay_bind_test.go",
                 "Makefile"
             ],
             publicHeadersPath: ".",
             linkerSettings: [.linkedLibrary("wg-go")]
+        ),
+        .testTarget(
+            name: "WireGuardKitTests",
+            dependencies: ["WireGuardKit"],
+            linkerSettings: [
+                .unsafeFlags(["-L", "Sources/WireGuardKitGo/out"])
+            ]
         )
     ]
 )
