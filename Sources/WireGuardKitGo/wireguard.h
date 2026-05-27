@@ -20,4 +20,20 @@ extern void wgBumpSockets(int handle);
 extern void wgDisableSomeRoamingForBrokenMobileSemantics(int handle);
 extern const char *wgVersion();
 
+typedef void (*wg_relay_send_callback_t)(void *context,
+                                         const uint8_t *endpoint,
+                                         size_t endpoint_len,
+                                         const uint8_t *data,
+                                         size_t data_len);
+extern int32_t wgTurnOnWithRelayBind(const char *settings,
+                                     int32_t tun_fd,
+                                     wg_relay_send_callback_t send_cb,
+                                     void *send_ctx);
+extern void wgRelayBindInjectReceive(int32_t handle,
+                                     const char *endpoint,
+                                     size_t endpoint_len,
+                                     const uint8_t *data,
+                                     size_t data_len);
+extern void wgRelayBindUnregister(int32_t handle);
+
 #endif

@@ -36,6 +36,43 @@ private enum State {
 
     /// The tunnel is temporarily shutdown due to device going offline
     case temporaryShutdown(_ settingsGenerator: PacketTunnelSettingsGenerator)
+
+    /// The tunnel is up and running with a Swift-supplied relay transport
+    /// (see `WireGuardRelayBindBridge`).
+    case startedWithRelayBind(
+        _ handle: Int32,
+        _ settingsGenerator: PacketTunnelSettingsGenerator,
+        _ bridge: WireGuardRelayBindBridge,
+        _ context: WireGuardRelayBindContext
+    )
+}
+
+/// A bridge supplied by the embedding app that ferries wireguard-go's
+/// encrypted UDP datagrams over a custom transport (for example a USB-C link
+/// to an iPhone) instead of the host network stack's default UDP socket.
+///
+/// The adapter calls ``send(data:endpoint:)`` for every outbound datagram. The
+/// adapter also calls ``attach(injector:)`` once during `start` so the bridge
+/// knows how to push inbound datagrams back into wireguard-go.
+public protocol WireGuardRelayBindBridge: AnyObject {
+    /// Forward an encrypted datagram to the transport addressed by `endpoint`.
+    /// The endpoint string is whatever the consumer puts on the UAPI
+    /// `endpoint=` line (typically `host:port` of the peer-side relay).
+    func send(data: Data, endpoint: String)
+
+    /// Called once by the adapter so the bridge knows how to push inbound
+    /// datagrams back into wireguard-go.
+    func attach(injector: @escaping (Data, String) -> Void)
+}
+
+/// Internal trampoline so the cgo callback can route through an `Unmanaged`
+/// context pointer back into Swift.
+final class WireGuardRelayBindContext {
+    weak var bridge: WireGuardRelayBindBridge?
+
+    init(bridge: WireGuardRelayBindBridge) {
+        self.bridge = bridge
+    }
 }
 
 public class WireGuardAdapter {
@@ -145,8 +182,14 @@ public class WireGuardAdapter {
         networkMonitor?.cancel()
 
         // Shutdown the tunnel
-        if case .started(let handle, _) = self.state {
+        switch self.state {
+        case .started(let handle, _):
             wgTurnOff(handle)
+        case .startedWithRelayBind(let handle, _, _, _):
+            wgRelayBindUnregister(handle)
+            wgTurnOff(handle)
+        case .temporaryShutdown, .stopped:
+            break
         }
     }
 
@@ -209,12 +252,128 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Start the tunnel with a Swift-supplied relay bridge instead of the
+    /// default wireguard-go UDP socket. The bridge is retained for the
+    /// lifetime of the started tunnel so its lifetime matches the adapter's
+    /// active session.
+    /// - Parameters:
+    ///   - tunnelConfiguration: tunnel configuration.
+    ///   - relayBind: bridge that ferries encrypted UDP datagrams.
+    ///   - completionHandler: completion handler.
+    public func start(
+        tunnelConfiguration: TunnelConfiguration,
+        relayBind: WireGuardRelayBindBridge,
+        completionHandler: @escaping (WireGuardAdapterError?) -> Void
+    ) {
+        workQueue.async {
+            guard case .stopped = self.state else {
+                completionHandler(.invalidState)
+                return
+            }
+
+            do {
+                let settingsGenerator = try self.makeSettingsGenerator(
+                    with: tunnelConfiguration
+                )
+                try self.setNetworkSettings(
+                    settingsGenerator.generateNetworkSettings()
+                )
+
+                let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
+                self.logEndpointResolutionResults(resolutionResults)
+
+                guard let tunnelFileDescriptor = self.tunnelFileDescriptor else {
+                    throw WireGuardAdapterError.cannotLocateTunnelFileDescriptor
+                }
+
+                let context = WireGuardRelayBindContext(bridge: relayBind)
+                let contextPtr = Unmanaged.passRetained(context).toOpaque()
+
+                let sendCallback: @convention(c) (
+                    UnsafeMutableRawPointer?,
+                    UnsafePointer<UInt8>?,
+                    Int,
+                    UnsafePointer<UInt8>?,
+                    Int
+                ) -> Void = { context, endpoint, endpointLen, data, dataLen in
+                    guard let context = context else { return }
+                    let box = Unmanaged<WireGuardRelayBindContext>
+                        .fromOpaque(context)
+                        .takeUnretainedValue()
+                    guard let bridge = box.bridge else { return }
+                    let endpointString: String
+                    if let endpoint = endpoint, endpointLen > 0 {
+                        endpointString = String(
+                            bytes: UnsafeBufferPointer(start: endpoint, count: endpointLen),
+                            encoding: .utf8
+                        ) ?? ""
+                    } else {
+                        endpointString = ""
+                    }
+                    let payload: Data
+                    if let data = data, dataLen > 0 {
+                        payload = Data(UnsafeBufferPointer(start: data, count: dataLen))
+                    } else {
+                        payload = Data()
+                    }
+                    bridge.send(data: payload, endpoint: endpointString)
+                }
+
+                let handle = wgConfig.withCString { settingsCString -> Int32 in
+                    return wgTurnOnWithRelayBind(
+                        settingsCString,
+                        tunnelFileDescriptor,
+                        sendCallback,
+                        contextPtr
+                    )
+                }
+                if handle < 0 {
+                    Unmanaged<WireGuardRelayBindContext>
+                        .fromOpaque(contextPtr).release()
+                    throw WireGuardAdapterError.startWireGuardBackend(handle)
+                }
+
+                let activeHandle = handle
+                relayBind.attach { data, endpoint in
+                    data.withUnsafeBytes { rawBuffer in
+                        let basePtr = rawBuffer.bindMemory(to: UInt8.self).baseAddress
+                        endpoint.withCString { endpointCString in
+                            wgRelayBindInjectReceive(
+                                activeHandle,
+                                endpointCString,
+                                endpoint.utf8.count,
+                                basePtr,
+                                data.count
+                            )
+                        }
+                    }
+                }
+
+                self.state = .startedWithRelayBind(
+                    activeHandle,
+                    settingsGenerator,
+                    relayBind,
+                    context
+                )
+                completionHandler(nil)
+            } catch let error as WireGuardAdapterError {
+                completionHandler(error)
+            } catch {
+                fatalError()
+            }
+        }
+    }
+
     /// Stop the tunnel.
     /// - Parameter completionHandler: completion handler.
     public func stop(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
             switch self.state {
             case .started(let handle, _):
+                wgTurnOff(handle)
+
+            case .startedWithRelayBind(let handle, _, _, _):
+                wgRelayBindUnregister(handle)
                 wgTurnOff(handle)
 
             case .temporaryShutdown:
@@ -268,6 +427,19 @@ public class WireGuardAdapter {
                     #endif
 
                     self.state = .started(handle, settingsGenerator)
+
+                case .startedWithRelayBind(let handle, _, let bridge, let context):
+                    let (wgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
+                    self.logEndpointResolutionResults(resolutionResults)
+
+                    wgSetConfig(handle, wgConfig)
+
+                    self.state = .startedWithRelayBind(
+                        handle,
+                        settingsGenerator,
+                        bridge,
+                        context
+                    )
 
                 case .temporaryShutdown:
                     self.state = .temporaryShutdown(settingsGenerator)
@@ -420,6 +592,8 @@ public class WireGuardAdapter {
         if case .started(let handle, _) = self.state {
             wgBumpSockets(handle)
         }
+        // .startedWithRelayBind intentionally ignores host network path
+        // changes; the relay transport handles its own connectivity.
         #elseif os(iOS)
         switch self.state {
         case .started(let handle, let settingsGenerator):
@@ -456,6 +630,11 @@ public class WireGuardAdapter {
                 self.logHandler(.error, "Failed to restart backend: \(error.localizedDescription)")
             }
 
+        case .startedWithRelayBind:
+            // The relay transport handles connectivity outside of the host
+            // NWPathMonitor, so we intentionally do nothing here.
+            break
+
         case .stopped:
             // no-op
             break
@@ -485,3 +664,4 @@ private extension Network.NWPath.Status {
         }
     }
 }
+
